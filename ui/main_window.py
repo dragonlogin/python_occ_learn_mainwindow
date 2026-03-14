@@ -65,6 +65,7 @@ class MainWindow(QMainWindow):
 
         self._items: List[ShapeItem] = []
         self._color_idx = 0
+        self._colliding_indices: set = set()
 
         self._build_ui()
         QTimer.singleShot(50, self._init_scene)
@@ -151,6 +152,12 @@ class MainWindow(QMainWindow):
         self.viewer.sig_selected.connect(self._on_viewer_select)
         lay.addWidget(self.viewer, stretch=1)
         return right
+
+    def _set_shape_color(self, item: ShapeItem, r: float, g: float, b: float):
+        """修改视口中形体的显示颜色，不影响 item.color 原始记录。"""
+        ctx = self.viewer._display.Context
+        ctx.SetColor(item.ais, qty_color(r, g, b), False)
+        ctx.UpdateCurrentViewer()
 
     # ── 初始场景 ──────────────────────────────────────────────────────────────
 
@@ -241,6 +248,7 @@ class MainWindow(QMainWindow):
             self.viewer._dist_line_ais = None
         ctx.UpdateCurrentViewer()
         self.viewer.set_items(self._items)
+        self._colliding_indices.discard(idx)
         self._refresh_all()
         self._set_status(f"已删除: {item.name}", "#ffaa44")
 
@@ -277,6 +285,27 @@ class MainWindow(QMainWindow):
 
     def _on_collision(self, entries: List[CollisionEntry]):
         self.panel_collision.update_collisions(entries, self._items)
+
+        thresh = self.panel_collision.threshold
+        now_colliding = set()
+
+        for e in entries:
+            if e.is_colliding(thresh):
+                now_colliding.add(e.index_a)
+                now_colliding.add(e.index_b)
+
+        # 新进入碰撞 → 变红
+        for idx in now_colliding - self._colliding_indices:
+            if 0 <= idx < len(self._items):
+                self._set_shape_color(self._items[idx], 1.0, 0.15, 0.15)
+
+        # 已离开碰撞 → 恢复原色
+        for idx in self._colliding_indices - now_colliding:
+            if 0 <= idx < len(self._items):
+                r, g, b = self._items[idx].color
+                self._set_shape_color(self._items[idx], r, g, b)
+
+        self._colliding_indices = now_colliding
 
     def _on_viewer_select(self, idx: int):
         self.panel_shapes.select_row(idx)

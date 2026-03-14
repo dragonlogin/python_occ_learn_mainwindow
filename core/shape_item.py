@@ -53,7 +53,9 @@ class ShapeItem:
 
     def located_shape(self) -> TopoDS_Shape:
         """返回已附加 Location 的 TopoDS_Shape，供 BRepExtrema 等使用。"""
-        return self.ais.Shape()
+        trsf = gp_Trsf()
+        trsf.SetTranslation(self.offset)
+        return self.topo.Located(TopLoc_Location(trsf))
 
     def center(self) -> gp_Pnt:
         """返回包围盒中心（世界坐标）。"""
