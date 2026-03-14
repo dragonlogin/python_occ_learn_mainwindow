@@ -12,7 +12,7 @@ viewer/occ_viewer.py  ── 3D 视口
   - 支持撤销：每次 mouseReleaseEvent 将前一 offset 压栈。
 """
 
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 from OCC.Core.AIS import AIS_Shape
 from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
@@ -63,6 +63,7 @@ class OCCViewer(qtViewer3d):
 
         # 距离连线 AIS（每帧重建）
         self._dist_line_ais: Optional[AIS_Shape] = None
+        
 
     # ── 外部接口 ──────────────────────────────────────────────────────────────
 
@@ -124,7 +125,7 @@ class OCCViewer(qtViewer3d):
                     self._drag_item     = item
                     self._drag_ref_pnt  = item.center()
                     self._drag_wstart   = self._screen_to_world(sx, sy, self._drag_ref_pnt)
-                    self._drag_off_base = gp_Vec(item.offset)
+                    self._drag_off_base = item.offset
 
                     idx = self._items.index(item)
                     self.sig_selected.emit(idx)

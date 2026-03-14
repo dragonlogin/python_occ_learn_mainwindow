@@ -281,7 +281,6 @@ class MainWindow(QMainWindow):
     def _on_viewer_select(self, idx: int):
         self.panel_shapes.select_row(idx)
         self.panel_measure.select_item(idx)
-        self.tabs.setCurrentIndex(0)
 
     def _on_pair_changed(self, i: int, j: int):
         if i != j:
