@@ -30,6 +30,13 @@ from core.analysis   import (
 )
 from utils.helpers import qty_color
 
+from OCC.Core.AIS import AIS_Trihedron, AIS_ViewCube
+from OCC.Core.Geom import Geom_Axis2Placement
+from OCC.Core.gp  import gp_Ax2, gp_Pnt, gp_Dir
+from OCC.Core.Prs3d import Prs3d_DatumParts
+from OCC.Core.V3d import V3d_ZBUFFER
+
+
 # 碰撞判定阈值（仅用于连线着色）
 _NEAR_THRESHOLD = 0.01
 
@@ -113,7 +120,17 @@ class OCCViewer(qtViewer3d):
             ctx    = self._display.Context
             view   = self._display.GetView()
 
+            # 先移动检测，不 Select
             ctx.MoveTo(sx, sy, view, True)
+
+            # ← 检查光标下的对象，ViewCube 在这里能检测到
+            if ctx.HasDetected():
+                detected = ctx.DetectedInteractive()
+                if detected.DynamicType().Name() == "AIS_ViewCube":
+                    super().mousePressEvent(event)
+                    return
+
+            # 普通形体走原来的 Select 流程
             ctx.Select(True)
             ctx.InitSelected()
 
@@ -215,3 +232,70 @@ class OCCViewer(qtViewer3d):
         ctx.Deactivate(ae)                  # 不参与鼠标拾取
         ctx.CurrentViewer().Redraw()
         self._dist_line_ais = ae
+
+    def add_trihedron(self, size: float = 30.0, trans: float = 0.08) -> None:
+        """在世界原点添加 XYZ 坐标轴。"""
+        axis = Geom_Axis2Placement(
+            gp_Ax2(gp_Pnt(0, 0, 0),
+                gp_Dir(0, 0, 1),
+                gp_Dir(1, 0, 0))
+        )
+        tri = AIS_Trihedron(axis)
+        tri.SetSize(size)
+         # 分轴设置颜色：箭头 + 轴线各自独立
+        dp = Prs3d_DatumParts
+        tri.SetDatumPartColor(dp.Prs3d_DP_XAxis,  qty_color(1.0, 0.2, 0.2))
+        tri.SetDatumPartColor(dp.Prs3d_DP_XArrow, qty_color(1.0, 0.2, 0.2))
+        tri.SetDatumPartColor(dp.Prs3d_DP_YAxis,  qty_color(0.2, 1.0, 0.2))
+        tri.SetDatumPartColor(dp.Prs3d_DP_YArrow, qty_color(0.2, 1.0, 0.2))
+        tri.SetDatumPartColor(dp.Prs3d_DP_ZAxis,  qty_color(0.2, 0.5, 1.0))
+        tri.SetDatumPartColor(dp.Prs3d_DP_ZArrow, qty_color(0.2, 0.5, 1.0))
+        ctx = self._display.Context
+        ctx.Display(tri, False)
+        ctx.Deactivate(tri)   # 不参与鼠标拾取
+        ctx.UpdateCurrentViewer()
+        self._trihedron = tri
+
+        """右下角固定坐标系，使用视图原生 TriedronDisplay。"""
+        from OCC.Core.Aspect import Aspect_TOTP_RIGHT_LOWER
+        view = self._display.GetView()
+        view.TriedronDisplay(
+            Aspect_TOTP_RIGHT_LOWER,   # 右下角
+            qty_color(1.0, 1.0, 1.0), # 文字颜色
+            trans,                      # 相对视图大小，0.08 = 8%
+            V3d_ZBUFFER,               # 渲染模式
+        )
+        view.Redraw()
+
+    def add_view_cube(self) -> None:
+        from OCC.Core.Graphic3d import (
+            Graphic3d_TransformPers,
+            Graphic3d_TMF_TriedronPers,
+            Graphic3d_Vec2i,
+        )
+        from OCC.Core.Aspect import Aspect_TOTP_RIGHT_UPPER
+
+        cube = AIS_ViewCube()
+        cube.SetSize(55)
+        cube.SetFontHeight(10)
+        cube.SetFixedAnimationLoop(True)
+        
+        # 点击 ViewCube 旋转视角时，不自动执行 FitAll（避免视角放大/缩小）
+        if hasattr(cube, "SetResetCamera"):
+            cube.SetResetCamera(False)
+        
+        # 如果需要，也可以设置不自动适应选中对象
+        if hasattr(cube, "SetFitSelected"):
+            cube.SetFitSelected(False)
+
+        trsf = Graphic3d_TransformPers(
+            Graphic3d_TMF_TriedronPers,
+            Aspect_TOTP_RIGHT_UPPER,
+            Graphic3d_Vec2i(80, 80),
+        )
+        cube.SetTransformPersistence(trsf)
+
+        ctx = self._display.Context
+        ctx.Display(cube, False)
+        ctx.UpdateCurrentViewer()
+        self._view_cube = cube

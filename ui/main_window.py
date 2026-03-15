@@ -175,6 +175,10 @@ class MainWindow(QMainWindow):
         for it in [box_item, sph_item]:
             self._register_item(it)
 
+        # ── 新增：坐标轴 + ViewCube ───────────────────────
+        self.viewer.add_trihedron(size=40, trans=0.2)
+        self.viewer.add_view_cube()
+
         self.viewer._display.FitAll()
         self._refresh_all()
 

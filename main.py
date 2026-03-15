@@ -13,7 +13,6 @@ import sys
 
 # ── Qt 后端自动探测 ───────────────────────────────────────────────────────────
 from OCC.Display.backend import load_backend
-
 _loaded = False
 for _backend in ["pyqt5", "pyqt6", "pyside2", "pyside6"]:
     try:
