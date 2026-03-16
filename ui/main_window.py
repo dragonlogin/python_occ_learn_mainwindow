@@ -1,44 +1,58 @@
 """
 ui/main_window.py  ── 主窗口
 
-负责：
-  1. 组装侧边栏 Tabs 与 3D 视口
-  2. 连接所有 Panel 信号
-  3. 管理 ShapeItem 列表（增 / 删 / 隐）
-  4. 创建初始场景
+布局：
+  ┌─── RibbonTabBar（38px，全宽）────────────────────────────────────┐
+  │  OCC Analyzer  v1.0  │ [形体] [距离] [碰撞] [测量] [线框] [设置]  │
+  ├─── sidebar（280px）──┬── viewport ──────────────────────────────┤
+  │  QStackedWidget      │  状态栏（30px）                           │
+  │  ← 当前 Tab 的面板   │  3D View                                  │
+  └──────────────────────┴──────────────────────────────────────────┘
 
-扩展指引：
-  - 新增 Tab：在 _build_sidebar() 中 addTab 即可，无需改动其他模块。
-  - 新增体素：在 _PRIMITIVES_FACTORIES 字典中注册工厂函数。
-  - 支持撤销：在 _add_item / _delete_shape 前后维护 command stack。
+扩展：
+  - 新增 Tab：在 _build_sidebar() 向 stack 添加页面，并在
+    ribbon_tab_bar.py 的 _TAB_LABELS 添加名称。
+  - 新增体素：在 _PRIMITIVES_FACTORIES 注册工厂函数。
 """
 
 import os
-from typing import List, Optional
+from typing import List
 
-from OCC.Core.AIS import AIS_Shape
+from OCC.Core.AIS        import AIS_Shape
+from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
 from OCC.Core.BRepPrimAPI import (
     BRepPrimAPI_MakeBox, BRepPrimAPI_MakeSphere,
     BRepPrimAPI_MakeCylinder, BRepPrimAPI_MakeCone,
 )
-from OCC.Core.TopoDS import TopoDS_Shape
-from OCC.Core.gp import gp_Vec
+from OCC.Core.TopoDS  import TopoDS_Shape
+from OCC.Core.gp      import gp_Pnt, gp_Vec
+from OCC.Core.Quantity import Quantity_Color, Quantity_TOC_RGB
 
-from PyQt5.QtCore import QTimer, Qt
+from PyQt5.QtCore    import QTimer, Qt, QSettings
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
-    QLabel, QFrame, QTabWidget, QSizePolicy, QMessageBox,
+    QLabel, QSizePolicy, QMessageBox, QStackedWidget,
 )
 
 from core.shape_item import ShapeItem
 from core.importer   import import_file
 from core.analysis   import DistanceResult, CollisionEntry
-from viewer.occ_viewer import OCCViewer
+from viewer.occ_viewer      import OCCViewer
 from panels.shapes_panel    import ShapesPanel
 from panels.distance_panel  import DistancePanel
 from panels.collision_panel import CollisionPanel
 from panels.measure_panel   import MeasurePanel
-from utils.helpers import qty_color
+from panels.line_box_panel  import LineBoxPanel
+from typing import List as _List  # avoid shadowing below
+from panels.settings_panel  import SettingsPanel
+from ui.ribbon_tab_bar      import RibbonTabBar
+from utils.helpers   import qty_color
+from ui.styles       import build_qss
+
+try:
+    from create_box import process_multiple_lines
+except ImportError:
+    from core.create_box import process_multiple_lines
 
 # ── 体素颜色池 ────────────────────────────────────────────────────────────────
 _COLORS = [
@@ -48,7 +62,6 @@ _COLORS = [
     (0.20, 0.80, 0.90), (0.90, 0.50, 0.10),
 ]
 
-# ── 体素工厂（扩展：在此注册新体素）────────────────────────────────────────────
 _PRIMITIVES_FACTORIES = {
     "Box":      lambda: BRepPrimAPI_MakeBox(40, 30, 20).Shape(),
     "Sphere":   lambda: BRepPrimAPI_MakeSphere(20).Shape(),
@@ -65,9 +78,17 @@ class MainWindow(QMainWindow):
 
         self._items: List[ShapeItem] = []
         self._color_idx = 0
-        self._colliding_indices: set = set()
+        self._linebox_extra_ais: list = []
+        self._linebox_items: List[ShapeItem] = []
+
+        # 从本地配置读取上次保存的字体大小，默认 12
+        self._settings = QSettings("OCCAnalyzer", "Preferences")
+        self._font_size = int(self._settings.value("font_size", 12))
 
         self._build_ui()
+        # 用持久化的字体大小初始化（同时同步设置面板的选中状态）
+        self._apply_font(self._font_size, silent=True)
+        self.panel_settings._apply_size(self._font_size, silent=True)
         QTimer.singleShot(50, self._init_scene)
 
     # ── UI 构建 ───────────────────────────────────────────────────────────────
@@ -75,51 +96,59 @@ class MainWindow(QMainWindow):
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
-        root = QHBoxLayout(central)
+        root = QVBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        root.addWidget(self._build_sidebar())
-        root.addWidget(self._build_viewport(), stretch=1)
+        # 1. 顶部 Ribbon Tab 条（全宽）
+        self.ribbon = RibbonTabBar()
+        self.ribbon.sig_tab_changed.connect(self._on_tab_changed)
+        root.addWidget(self.ribbon)
+
+        # 2. 主体（sidebar + viewport 横向）
+        body = QWidget()
+        body_lay = QHBoxLayout(body)
+        body_lay.setContentsMargins(0, 0, 0, 0)
+        body_lay.setSpacing(0)
+        body_lay.addWidget(self._build_sidebar())
+        body_lay.addWidget(self._build_viewport(), stretch=1)
+        root.addWidget(body, stretch=1)
+
+    # ── 侧边栏（QStackedWidget 承载各面板）───────────────────────────────────
 
     def _build_sidebar(self) -> QWidget:
         sidebar = QWidget()
         sidebar.setObjectName("sidebar")
         sidebar.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+
         lay = QVBoxLayout(sidebar)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
 
-        # App 标题栏
-        title_bar = QWidget()
-        title_bar.setFixedHeight(48)
-        title_bar.setStyleSheet(
-            "background:#0d0d1c; border-bottom:1px solid #202040;")
-        tbl = QHBoxLayout(title_bar)
-        tbl.setContentsMargins(14, 0, 14, 0)
-        app_title = QLabel("OCC Analyzer")
-        app_title.setStyleSheet(
-            "color:#7eb8f7; font-size:15px; font-weight:700; letter-spacing:1px;")
-        ver = QLabel("v1.0")
-        ver.setStyleSheet("color:#404070; font-size:11px;")
-        tbl.addWidget(app_title)
-        tbl.addStretch()
-        tbl.addWidget(ver)
-        lay.addWidget(title_bar)
-
-        # Tabs
-        self.tabs = QTabWidget()
+        # ── 构建各面板 ──────────────────────────────────────────────────────
         self.panel_shapes    = ShapesPanel()
         self.panel_distance  = DistancePanel()
         self.panel_collision = CollisionPanel()
         self.panel_measure   = MeasurePanel()
-        self.tabs.addTab(self.panel_shapes,    "形体")
-        self.tabs.addTab(self.panel_distance,  "距离")
-        self.tabs.addTab(self.panel_collision, "碰撞")
-        self.tabs.addTab(self.panel_measure,   "测量")
-        lay.addWidget(self.tabs)
+        self.panel_linebox   = LineBoxPanel()
+        self.panel_settings  = SettingsPanel()
 
-        # 信号
+        # ── QStackedWidget ──────────────────────────────────────────────────
+        self.stack = QStackedWidget()
+        self.stack.setObjectName("sidebar")   # 继承 sidebar 背景样式
+        for panel in (
+            self.panel_shapes,
+            self.panel_distance,
+            self.panel_collision,
+            self.panel_measure,
+            self.panel_linebox,
+            self.panel_settings,
+        ):
+            self.stack.addWidget(panel)
+
+        lay.addWidget(self.stack)
+
+        # ── 信号连接 ──────────────────────────────────────────────────────
         self.panel_shapes.sig_add_primitive.connect(self._add_primitive)
         self.panel_shapes.sig_import_file.connect(self._import_file)
         self.panel_shapes.sig_delete.connect(self._delete_shape)
@@ -130,7 +159,12 @@ class MainWindow(QMainWindow):
         self.panel_collision.spin.valueChanged.connect(
             lambda _: self.viewer.run_analysis()
         )
+        self.panel_linebox.sig_lines_changed.connect(self._on_linebox_changed)
+        self.panel_settings.sig_font_changed.connect(self._apply_font)
+
         return sidebar
+
+    # ── 视口 ─────────────────────────────────────────────────────────────────
 
     def _build_viewport(self) -> QWidget:
         right = QWidget()
@@ -153,33 +187,16 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.viewer, stretch=1)
         return right
 
-    def _set_shape_color(self, item: ShapeItem, r: float, g: float, b: float):
-        """修改视口中形体的显示颜色，不影响 item.color 原始记录。"""
-        ctx = self.viewer._display.Context
-        ctx.SetColor(item.ais, qty_color(r, g, b), False)
-        ctx.UpdateCurrentViewer()
+    # ── Tab 切换 ──────────────────────────────────────────────────────────────
+
+    def _on_tab_changed(self, idx: int):
+        self.stack.setCurrentIndex(idx)
 
     # ── 初始场景 ──────────────────────────────────────────────────────────────
 
     def _init_scene(self):
         self.viewer.InitDriver()
         self.viewer._display.set_bg_gradient_color([10, 10, 20], [22, 22, 45])
-
-        box_topo = BRepPrimAPI_MakeBox(40, 30, 20).Shape()
-        box_item = self._make_item(box_topo, "Box_1")
-
-        sph_topo = BRepPrimAPI_MakeSphere(18).Shape()
-        sph_item = self._make_item(sph_topo, "Sphere_1")
-        sph_item.offset = gp_Vec(110, 0, 0)
-
-        for it in [box_item, sph_item]:
-            self._register_item(it)
-
-        # ── 新增：坐标轴 + ViewCube ───────────────────────
-        self.viewer.add_trihedron(size=40, trans=0.2)
-        self.viewer.add_view_cube()
-
-        self.viewer._display.FitAll()
         self._refresh_all()
 
     # ── 形体管理 ──────────────────────────────────────────────────────────────
@@ -192,7 +209,6 @@ class MainWindow(QMainWindow):
         return ShapeItem(name=name, ais=ais, topo=topo, color=(r, g, b))
 
     def _register_item(self, item: ShapeItem):
-        """将 ShapeItem 显示到视口并加入列表。"""
         ctx = self.viewer._display.Context
         ctx.Display(item.ais, False)
         ctx.SetTransparency(item.ais, 0.25, False)
@@ -210,7 +226,6 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "错误", f"创建形体失败:\n{e}")
             return
-
         name = f"{prim}_{len(self._items) + 1}"
         item = self._make_item(topo, name)
         item.offset = gp_Vec(len(self._items) * 70, 0, 0)
@@ -223,17 +238,11 @@ class MainWindow(QMainWindow):
         try:
             topo = import_file(path)
         except ValueError as e:
-            QMessageBox.warning(self, "不支持的格式", str(e))
-            return
+            QMessageBox.warning(self, "不支持的格式", str(e)); return
         except Exception as e:
-            QMessageBox.critical(self, "导入错误", str(e))
-            return
-
+            QMessageBox.critical(self, "导入错误", str(e)); return
         if topo is None:
-            QMessageBox.warning(self, "导入失败",
-                                f"文件读取失败，请检查文件格式:\n{path}")
-            return
-
+            QMessageBox.warning(self, "导入失败", f"文件读取失败:\n{path}"); return
         name = os.path.splitext(os.path.basename(path))[0]
         item = self._make_item(topo, name)
         self._register_item(item)
@@ -252,7 +261,6 @@ class MainWindow(QMainWindow):
             self.viewer._dist_line_ais = None
         ctx.UpdateCurrentViewer()
         self.viewer.set_items(self._items)
-        self._colliding_indices.discard(idx)
         self._refresh_all()
         self._set_status(f"已删除: {item.name}", "#ffaa44")
 
@@ -268,7 +276,103 @@ class MainWindow(QMainWindow):
             ctx.Erase(item.ais, True)
         self.panel_shapes.refresh(self._items)
 
-    # ── 刷新所有面板 ──────────────────────────────────────────────────────────
+    # ── 线框渲染管理 ──────────────────────────────────────────────────────────
+
+    def _clear_linebox_render(self):
+        """移除上一次线框生成的所有 AIS 对象（面 + 法向量 + 原始线段）。"""
+        ctx = self.viewer._display.Context
+
+        # 1. 移除法向量箭头和原始线段（不在 _items 中）
+        for ais in self._linebox_extra_ais:
+            ctx.Remove(ais, False)
+        self._linebox_extra_ais.clear()
+
+        # 2. 移除线框生成的面（在 _items 中，需同步删除）
+        for item in self._linebox_items:
+            ctx.Remove(item.ais, False)
+            if item in self._items:
+                self._items.remove(item)
+        self._linebox_items.clear()
+
+        ctx.UpdateCurrentViewer()
+
+    def _on_linebox_changed(self, lines: list):
+        """线段列表变化时调用：先清空旧渲染，再按新列表重建。"""
+        # 总是先清空
+        self._clear_linebox_render()
+
+        # 线段不足 2 条时只清空，不生成
+        if len(lines) < 2:
+            self._refresh_all()
+            if not lines:
+                self.panel_linebox._set_status("已清空", "#ffaa66")
+            return
+
+        # 生成新几何体
+        try:
+            faces = process_multiple_lines(lines)
+        except Exception as e:
+            QMessageBox.critical(self, "生成错误", str(e))
+            return
+
+        if not faces:
+            self.panel_linebox._set_status("⚠ 无法生成有效面，请检查法向量", "#ff7766")
+            self._refresh_all()
+            return
+
+        ctx = self.viewer._display.Context
+        face_colors = [
+            (1.0,0.3,0.3),(0.3,1.0,0.4),(0.3,0.5,1.0),
+            (1.0,0.9,0.2),(1.0,0.3,0.9),(0.2,0.9,0.9),(0.7,0.7,0.7),
+        ]
+
+        for i, fi in enumerate(faces):
+            r, g, b = face_colors[i % len(face_colors)]
+            color = Quantity_Color(r, g, b, Quantity_TOC_RGB)
+
+            # 面 → ShapeItem，加入 _items 和 _linebox_items
+            name = f"Face_{len(self._items) + 1}"
+            item = self._make_item(fi['face'], name)
+            item.color = (r, g, b)
+            item.ais.SetColor(color)
+            self._register_item(item)
+            self._linebox_items.append(item)   # ← 记录，便于下次清除
+
+            # 法向量箭头 → extra AIS
+            nv = AIS_Shape(fi['normal_vector'])
+            nv.SetColor(color)
+            ctx.Display(nv, False)
+            self._linebox_extra_ais.append(nv)  # ← 记录
+
+        # 原始线段（白色） → extra AIS
+        white = Quantity_Color(1, 1, 1, Quantity_TOC_RGB)
+        for line in lines:
+            edge = BRepBuilderAPI_MakeEdge(
+                gp_Pnt(float(line.start[0]), float(line.start[1]), float(line.start[2])),
+                gp_Pnt(float(line.end[0]),   float(line.end[1]),   float(line.end[2])),
+            ).Edge()
+            ea = AIS_Shape(edge)
+            ea.SetColor(white)
+            ctx.Display(ea, False)
+            self._linebox_extra_ais.append(ea)  # ← 记录
+
+        ctx.UpdateCurrentViewer()
+        self.viewer._display.FitAll()
+        self._refresh_all()
+
+        msg = f"✓ 已生成 {len(faces)} 个面"
+        self.panel_linebox._set_status(msg, "#88ffcc")
+        self._set_status(f"✓ 线框：{len(lines)} 条线段 → {len(faces)} 个面", "#44ddcc")
+
+    # ── 字体 ─────────────────────────────────────────────────────────────────
+
+    def _apply_font(self, size: int, silent: bool = False):
+        self._font_size = size
+        self.setStyleSheet(build_qss(size))
+        if not silent:
+            self._settings.setValue("font_size", size)
+
+    # ── 刷新 ─────────────────────────────────────────────────────────────────
 
     def _refresh_all(self):
         self.panel_shapes.refresh(self._items)
@@ -290,30 +394,12 @@ class MainWindow(QMainWindow):
     def _on_collision(self, entries: List[CollisionEntry]):
         self.panel_collision.update_collisions(entries, self._items)
 
-        thresh = self.panel_collision.threshold
-        now_colliding = set()
-
-        for e in entries:
-            if e.is_colliding(thresh):
-                now_colliding.add(e.index_a)
-                now_colliding.add(e.index_b)
-
-        # 新进入碰撞 → 变红
-        for idx in now_colliding - self._colliding_indices:
-            if 0 <= idx < len(self._items):
-                self._set_shape_color(self._items[idx], 1.0, 0.15, 0.15)
-
-        # 已离开碰撞 → 恢复原色
-        for idx in self._colliding_indices - now_colliding:
-            if 0 <= idx < len(self._items):
-                r, g, b = self._items[idx].color
-                self._set_shape_color(self._items[idx], r, g, b)
-
-        self._colliding_indices = now_colliding
-
     def _on_viewer_select(self, idx: int):
         self.panel_shapes.select_row(idx)
         self.panel_measure.select_item(idx)
+        # 视口点击时跳回形体 Tab
+        self.ribbon.set_tab(0)
+        self.stack.setCurrentIndex(0)
 
     def _on_pair_changed(self, i: int, j: int):
         if i != j:
