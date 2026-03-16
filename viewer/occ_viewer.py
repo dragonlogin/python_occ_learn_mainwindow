@@ -233,7 +233,7 @@ class OCCViewer(qtViewer3d):
         ctx.CurrentViewer().Redraw()
         self._dist_line_ais = ae
 
-    def add_trihedron(self, size: float = 30.0, trans: float = 0.08) -> None:
+    def add_trihedron(self, size: float = 50.0, trans: float = 0.08) -> None:
         """在世界原点添加 XYZ 坐标轴。"""
         axis = Geom_Axis2Placement(
             gp_Ax2(gp_Pnt(0, 0, 0),
@@ -276,7 +276,7 @@ class OCCViewer(qtViewer3d):
         from OCC.Core.Aspect import Aspect_TOTP_RIGHT_UPPER
 
         cube = AIS_ViewCube()
-        cube.SetSize(55)
+        cube.SetSize(60)
         cube.SetFontHeight(10)
         cube.SetFixedAnimationLoop(True)
         

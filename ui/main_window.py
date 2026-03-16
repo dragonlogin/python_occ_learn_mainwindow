@@ -197,6 +197,8 @@ class MainWindow(QMainWindow):
     def _init_scene(self):
         self.viewer.InitDriver()
         self.viewer._display.set_bg_gradient_color([10, 10, 20], [22, 22, 45])
+        self.viewer.add_trihedron()
+        self.viewer.add_view_cube()
         self._refresh_all()
 
     # ── 形体管理 ──────────────────────────────────────────────────────────────
