@@ -15,6 +15,10 @@ ui/main_window.py  ── 主窗口
   - 新增体素：在 _PRIMITIVES_FACTORIES 注册工厂函数。
 """
 
+"""
+ui/main_window.py  ── 主窗口（含 Undo / Redo）
+"""
+
 import os
 from typing import List
 
@@ -32,18 +36,24 @@ from PyQt5.QtCore    import QTimer, Qt, QSettings
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QSizePolicy, QMessageBox, QStackedWidget,
+    QShortcut,
 )
+from PyQt5.QtGui import QKeySequence
 
 from core.shape_item import ShapeItem
 from core.importer   import import_file
 from core.analysis   import DistanceResult, CollisionEntry
+from core.commands   import (
+    AppContext, AddShapeCommand, DeleteShapeCommand,
+    ToggleVisibilityCommand, LineboxUpdateCommand, ChangeFontCommand,
+)
+from core.command_stack import CommandStack
 from viewer.occ_viewer      import OCCViewer
 from panels.shapes_panel    import ShapesPanel
 from panels.distance_panel  import DistancePanel
 from panels.collision_panel import CollisionPanel
 from panels.measure_panel   import MeasurePanel
 from panels.line_box_panel  import LineBoxPanel
-from typing import List as _List  # avoid shadowing below
 from panels.settings_panel  import SettingsPanel
 from ui.ribbon_tab_bar      import RibbonTabBar
 from utils.helpers   import qty_color
@@ -69,6 +79,11 @@ _PRIMITIVES_FACTORIES = {
     "Cone":     lambda: BRepPrimAPI_MakeCone(15, 5, 40).Shape(),
 }
 
+_FACE_COLORS = [
+    (1.0,0.3,0.3),(0.3,1.0,0.4),(0.3,0.5,1.0),
+    (1.0,0.9,0.2),(1.0,0.3,0.9),(0.2,0.9,0.9),(0.7,0.7,0.7),
+]
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -80,13 +95,19 @@ class MainWindow(QMainWindow):
         self._color_idx = 0
         self._linebox_extra_ais: list = []
         self._linebox_items: List[ShapeItem] = []
+        self._last_linebox_lines: list = []
 
         # 从本地配置读取上次保存的字体大小，默认 12
         self._settings = QSettings("OCCAnalyzer", "Preferences")
         self._font_size = int(self._settings.value("font_size", 12))
 
+        self.cmd_stack = CommandStack(self)
+        self.cmd_stack.sig_stack_changed.connect(self._on_stack_changed)
+
         self._build_ui()
-        # 用持久化的字体大小初始化（同时同步设置面板的选中状态）
+        self._build_ctx()
+        self._build_shortcuts()
+
         self._apply_font(self._font_size, silent=True)
         self.panel_settings._apply_size(self._font_size, silent=True)
         QTimer.singleShot(50, self._init_scene)
@@ -103,6 +124,8 @@ class MainWindow(QMainWindow):
         # 1. 顶部 Ribbon Tab 条（全宽）
         self.ribbon = RibbonTabBar()
         self.ribbon.sig_tab_changed.connect(self._on_tab_changed)
+        self.ribbon.sig_undo.connect(self.cmd_stack.undo)
+        self.ribbon.sig_redo.connect(self.cmd_stack.redo)
         root.addWidget(self.ribbon)
 
         # 2. 主体（sidebar + viewport 横向）
@@ -160,7 +183,7 @@ class MainWindow(QMainWindow):
             lambda _: self.viewer.run_analysis()
         )
         self.panel_linebox.sig_lines_changed.connect(self._on_linebox_changed)
-        self.panel_settings.sig_font_changed.connect(self._apply_font)
+        self.panel_settings.sig_font_changed.connect(self._on_font_changed)
 
         return sidebar
 
@@ -173,7 +196,7 @@ class MainWindow(QMainWindow):
         lay.setSpacing(0)
 
         self.status_bar = QLabel(
-            "就绪  ·  左键 点击选中 / 拖拽移动  ·  右键 旋转  ·  中键 平移  ·  滚轮 缩放")
+            "就绪  ·  左键点击选中/拖拽  ·  右键旋转  ·  中键平移  ·  滚轮缩放")
         self.status_bar.setFixedHeight(30)
         self.status_bar.setStyleSheet(
             "background:#0d0d1c; color:#404070; font-size:11px;"
@@ -187,21 +210,67 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.viewer, stretch=1)
         return right
 
-    # ── Tab 切换 ──────────────────────────────────────────────────────────────
+    def _build_ctx(self):
+        def _set_linebox_lines(lines):
+            self.panel_linebox._lines = list(lines)
+            self.panel_linebox._refresh_list()
 
-    def _on_tab_changed(self, idx: int):
-        self.stack.setCurrentIndex(idx)
+        self.ctx = AppContext(
+            items             = self._items,
+            display_item      = self._display_item,
+            hide_item         = self._hide_item,
+            toggle_item       = self._do_toggle_item,
+            refresh_all       = self._refresh_all,
+            fit_all           = lambda: self.viewer._display.FitAll(),
+            set_status        = self._set_status,
+            render_linebox    = self._render_linebox,
+            set_linebox_lines = _set_linebox_lines,
+            apply_font        = self._apply_font,
+            sync_font_panel   = lambda s: self.panel_settings._apply_size(s, silent=True),
+            make_item         = self._make_item,
+        )
+
+    def _build_shortcuts(self):
+        QShortcut(QKeySequence("Ctrl+Z"), self).activated.connect(self.cmd_stack.undo)
+        QShortcut(QKeySequence("Ctrl+Y"), self).activated.connect(self.cmd_stack.redo)
+        QShortcut(QKeySequence("Ctrl+Shift+Z"), self).activated.connect(self.cmd_stack.redo)
 
     # ── 初始场景 ──────────────────────────────────────────────────────────────
 
     def _init_scene(self):
         self.viewer.InitDriver()
         self.viewer._display.set_bg_gradient_color([10, 10, 20], [22, 22, 45])
-        self.viewer.add_trihedron()
-        self.viewer.add_view_cube()
         self._refresh_all()
 
-    # ── 形体管理 ──────────────────────────────────────────────────────────────
+    # ── 低级渲染原语 ──────────────────────────────────────────────────────────
+
+    def _display_item(self, item: ShapeItem):
+        ctx = self.viewer._display.Context
+        ctx.Display(item.ais, False)
+        ctx.SetTransparency(item.ais, 0.25, False)
+        item.apply_offset(ctx)
+        ctx.UpdateCurrentViewer()
+        self.viewer.set_items(self._items)
+
+    def _hide_item(self, item: ShapeItem):
+        ctx = self.viewer._display.Context
+        ctx.Remove(item.ais, False)
+        if self.viewer._dist_line_ais:
+            ctx.Remove(self.viewer._dist_line_ais, False)
+            self.viewer._dist_line_ais = None
+        ctx.UpdateCurrentViewer()
+        self.viewer.set_items(self._items)
+
+    def _do_toggle_item(self, item: ShapeItem):
+        item.visible = not item.visible
+        ctx = self.viewer._display.Context
+        if item.visible:
+            ctx.Display(item.ais, True)
+        else:
+            ctx.Erase(item.ais, True)
+        self.panel_shapes.refresh(self._items)
+
+    # ── 形体工厂 ──────────────────────────────────────────────────────────────
 
     def _make_item(self, topo: TopoDS_Shape, name: str) -> ShapeItem:
         r, g, b = _COLORS[self._color_idx % len(_COLORS)]
@@ -210,14 +279,7 @@ class MainWindow(QMainWindow):
         ais.SetColor(qty_color(r, g, b))
         return ShapeItem(name=name, ais=ais, topo=topo, color=(r, g, b))
 
-    def _register_item(self, item: ShapeItem):
-        ctx = self.viewer._display.Context
-        ctx.Display(item.ais, False)
-        ctx.SetTransparency(item.ais, 0.25, False)
-        item.apply_offset(ctx)
-        self._items.append(item)
-        ctx.UpdateCurrentViewer()
-        self.viewer.set_items(self._items)
+    # ── 操作 → 命令 ───────────────────────────────────────────────────────────
 
     def _add_primitive(self, prim: str):
         factory = _PRIMITIVES_FACTORIES.get(prim)
@@ -231,10 +293,7 @@ class MainWindow(QMainWindow):
         name = f"{prim}_{len(self._items) + 1}"
         item = self._make_item(topo, name)
         item.offset = gp_Vec(len(self._items) * 70, 0, 0)
-        self._register_item(item)
-        self.viewer._display.FitAll()
-        self._refresh_all()
-        self._set_status(f"✓ 已添加 {name}", "#88ee88")
+        self.cmd_stack.push(AddShapeCommand(self.ctx, item))
 
     def _import_file(self, path: str):
         try:
@@ -247,124 +306,85 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "导入失败", f"文件读取失败:\n{path}"); return
         name = os.path.splitext(os.path.basename(path))[0]
         item = self._make_item(topo, name)
-        self._register_item(item)
-        self.viewer._display.FitAll()
-        self._refresh_all()
-        self._set_status(f"✓ 已导入: {name}", "#88ee88")
+        self.cmd_stack.push(AddShapeCommand(self.ctx, item))
 
     def _delete_shape(self, idx: int):
         if not (0 <= idx < len(self._items)):
             return
-        item = self._items.pop(idx)
-        ctx  = self.viewer._display.Context
-        ctx.Remove(item.ais, False)
-        if self.viewer._dist_line_ais:
-            ctx.Remove(self.viewer._dist_line_ais, False)
-            self.viewer._dist_line_ais = None
-        ctx.UpdateCurrentViewer()
-        self.viewer.set_items(self._items)
-        self._refresh_all()
-        self._set_status(f"已删除: {item.name}", "#ffaa44")
+        item = self._items[idx]
+        self.cmd_stack.push(DeleteShapeCommand(self.ctx, item, idx))
 
     def _toggle_shape(self, idx: int):
         if not (0 <= idx < len(self._items)):
             return
-        item = self._items[idx]
-        ctx  = self.viewer._display.Context
-        item.visible = not item.visible
-        if item.visible:
-            ctx.Display(item.ais, True)
-        else:
-            ctx.Erase(item.ais, True)
-        self.panel_shapes.refresh(self._items)
+        self.cmd_stack.push(ToggleVisibilityCommand(self.ctx, self._items[idx]))
 
-    # ── 线框渲染管理 ──────────────────────────────────────────────────────────
+    def _on_font_changed(self, new_size: int):
+        self.cmd_stack.push(ChangeFontCommand(self.ctx, self._font_size, new_size))
+
+    # ── 线框 ─────────────────────────────────────────────────────────────────
+
+    def _on_linebox_changed(self, new_lines: list):
+        old_lines = list(self._last_linebox_lines)
+        self._last_linebox_lines = list(new_lines)
+        self.cmd_stack.push(LineboxUpdateCommand(self.ctx, old_lines, new_lines))
 
     def _clear_linebox_render(self):
-        """移除上一次线框生成的所有 AIS 对象（面 + 法向量 + 原始线段）。"""
         ctx = self.viewer._display.Context
-
-        # 1. 移除法向量箭头和原始线段（不在 _items 中）
         for ais in self._linebox_extra_ais:
             ctx.Remove(ais, False)
         self._linebox_extra_ais.clear()
-
-        # 2. 移除线框生成的面（在 _items 中，需同步删除）
         for item in self._linebox_items:
             ctx.Remove(item.ais, False)
             if item in self._items:
                 self._items.remove(item)
         self._linebox_items.clear()
-
         ctx.UpdateCurrentViewer()
 
-    def _on_linebox_changed(self, lines: list):
-        """线段列表变化时调用：先清空旧渲染，再按新列表重建。"""
-        # 总是先清空
+    def _render_linebox(self, lines: list):
         self._clear_linebox_render()
-
-        # 线段不足 2 条时只清空，不生成
         if len(lines) < 2:
             self._refresh_all()
-            if not lines:
-                self.panel_linebox._set_status("已清空", "#ffaa66")
             return
-
-        # 生成新几何体
         try:
             faces = process_multiple_lines(lines)
         except Exception as e:
-            QMessageBox.critical(self, "生成错误", str(e))
-            return
-
+            QMessageBox.critical(self, "生成错误", str(e)); return
         if not faces:
-            self.panel_linebox._set_status("⚠ 无法生成有效面，请检查法向量", "#ff7766")
+            self.panel_linebox._set_status("⚠ 无法生成有效面", "#ff7766")
             self._refresh_all()
             return
 
         ctx = self.viewer._display.Context
-        face_colors = [
-            (1.0,0.3,0.3),(0.3,1.0,0.4),(0.3,0.5,1.0),
-            (1.0,0.9,0.2),(1.0,0.3,0.9),(0.2,0.9,0.9),(0.7,0.7,0.7),
-        ]
-
         for i, fi in enumerate(faces):
-            r, g, b = face_colors[i % len(face_colors)]
+            r, g, b = _FACE_COLORS[i % len(_FACE_COLORS)]
             color = Quantity_Color(r, g, b, Quantity_TOC_RGB)
-
-            # 面 → ShapeItem，加入 _items 和 _linebox_items
-            name = f"Face_{len(self._items) + 1}"
-            item = self._make_item(fi['face'], name)
-            item.color = (r, g, b)
-            item.ais.SetColor(color)
-            self._register_item(item)
-            self._linebox_items.append(item)   # ← 记录，便于下次清除
-
-            # 法向量箭头 → extra AIS
-            nv = AIS_Shape(fi['normal_vector'])
-            nv.SetColor(color)
+            name  = f"Face_{len(self._items) + 1}"
+            item  = self._make_item(fi['face'], name)
+            item.color = (r, g, b); item.ais.SetColor(color)
+            self._items.append(item)
+            self._display_item(item)
+            self._linebox_items.append(item)
+            nv = AIS_Shape(fi['normal_vector']); nv.SetColor(color)
             ctx.Display(nv, False)
-            self._linebox_extra_ais.append(nv)  # ← 记录
+            self._linebox_extra_ais.append(nv)
 
-        # 原始线段（白色） → extra AIS
         white = Quantity_Color(1, 1, 1, Quantity_TOC_RGB)
         for line in lines:
             edge = BRepBuilderAPI_MakeEdge(
-                gp_Pnt(float(line.start[0]), float(line.start[1]), float(line.start[2])),
-                gp_Pnt(float(line.end[0]),   float(line.end[1]),   float(line.end[2])),
+                gp_Pnt(float(line.start[0]),float(line.start[1]),float(line.start[2])),
+                gp_Pnt(float(line.end[0]),  float(line.end[1]),  float(line.end[2])),
             ).Edge()
-            ea = AIS_Shape(edge)
-            ea.SetColor(white)
+            ea = AIS_Shape(edge); ea.SetColor(white)
             ctx.Display(ea, False)
-            self._linebox_extra_ais.append(ea)  # ← 记录
+            self._linebox_extra_ais.append(ea)
 
         ctx.UpdateCurrentViewer()
         self.viewer._display.FitAll()
         self._refresh_all()
-
-        msg = f"✓ 已生成 {len(faces)} 个面"
-        self.panel_linebox._set_status(msg, "#88ffcc")
-        self._set_status(f"✓ 线框：{len(lines)} 条线段 → {len(faces)} 个面", "#44ddcc")
+        n = len(faces)
+        self.panel_linebox._set_status(f"✓ 已生成 {n} 个面", "#88ffcc")
+        self._set_status(f"✓ 线框：{len(lines)} 条 → {n} 个面", "#44ddcc")
 
     # ── 字体 ─────────────────────────────────────────────────────────────────
 
@@ -382,6 +402,17 @@ class MainWindow(QMainWindow):
         self.panel_collision.update_collisions([], self._items)
         self.panel_measure.refresh_combos(self._items)
         self.viewer.run_analysis()
+
+    def _on_stack_changed(self):
+        self.ribbon.update_undo_redo(
+            self.cmd_stack.can_undo,
+            self.cmd_stack.can_redo,
+            self.cmd_stack.undo_text,
+            self.cmd_stack.redo_text,
+        )
+
+    def _on_tab_changed(self, idx: int):
+        self.stack.setCurrentIndex(idx)
 
     # ── 信号处理 ──────────────────────────────────────────────────────────────
 

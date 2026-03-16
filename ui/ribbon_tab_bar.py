@@ -1,8 +1,7 @@
 """
-ui/ribbon_tab_bar.py  ── 顶部 Ribbon Tab 条（仅标题 + 切换按钮）
+ui/ribbon_tab_bar.py  ── 顶部 Ribbon Tab 条（标题 + 切换按钮 + 撤销/重做）
 
 高度固定 38px，横跨全部宽度。
-点击 Tab 按钮后发射 sig_tab_changed(int)，主窗口据此切换左侧 QStackedWidget。
 """
 
 from PyQt5.QtCore    import pyqtSignal, Qt
@@ -42,6 +41,20 @@ QPushButton:hover {
 }
 """
 
+_ICON_BTN = """
+QPushButton {
+    background: transparent;
+    color: #505080;
+    border: none;
+    border-radius: 4px;
+    padding: 0 8px;
+    font-size: 13px;
+    min-width: 28px;
+}
+QPushButton:hover:enabled  { color: #aabbff; background: #1a1a38; }
+QPushButton:pressed:enabled { color: #7eb8f7; }
+QPushButton:disabled        { color: #2a2a48; }
+"""
 
 _TAB_LABELS = ["形体", "距离", "碰撞", "测量", "线框", "⚙ 设置"]
 
@@ -49,10 +62,14 @@ _TAB_LABELS = ["形体", "距离", "碰撞", "测量", "线框", "⚙ 设置"]
 class RibbonTabBar(QWidget):
     """
     Signals:
-        sig_tab_changed(int)  用户点击的 Tab 索引
+        sig_tab_changed(int)  Tab 切换
+        sig_undo()            点击撤销按钮
+        sig_redo()            点击重做按钮
     """
 
     sig_tab_changed = pyqtSignal(int)
+    sig_undo        = pyqtSignal()
+    sig_redo        = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -77,13 +94,35 @@ class RibbonTabBar(QWidget):
         ver.setStyleSheet("color:#303060; font-size:10px;")
         lay.addWidget(title)
         lay.addWidget(ver)
-        lay.addSpacing(24)
+        lay.addSpacing(16)
 
         # 竖分隔线
-        sep = QWidget()
-        sep.setFixedSize(1, 20)
-        sep.setStyleSheet("background:#252548;")
-        lay.addWidget(sep)
+        sep1 = QWidget(); sep1.setFixedSize(1, 20)
+        sep1.setStyleSheet("background:#252548;")
+        lay.addWidget(sep1)
+        lay.addSpacing(4)
+
+        # ── 撤销 / 重做按钮 ────────────────────────────────────────────────
+        self.btn_undo = QPushButton("↩")
+        self.btn_undo.setFixedHeight(38)
+        self.btn_undo.setStyleSheet(_ICON_BTN)
+        self.btn_undo.setToolTip("撤销  Ctrl+Z")
+        self.btn_undo.setEnabled(False)
+        self.btn_undo.clicked.connect(self.sig_undo)
+        lay.addWidget(self.btn_undo)
+
+        self.btn_redo = QPushButton("↪")
+        self.btn_redo.setFixedHeight(38)
+        self.btn_redo.setStyleSheet(_ICON_BTN)
+        self.btn_redo.setToolTip("重做  Ctrl+Y")
+        self.btn_redo.setEnabled(False)
+        self.btn_redo.clicked.connect(self.sig_redo)
+        lay.addWidget(self.btn_redo)
+
+        lay.addSpacing(4)
+        sep2 = QWidget(); sep2.setFixedSize(1, 20)
+        sep2.setStyleSheet("background:#252548;")
+        lay.addWidget(sep2)
         lay.addSpacing(8)
 
         # Tab 按钮
@@ -97,8 +136,6 @@ class RibbonTabBar(QWidget):
             lay.addWidget(btn)
 
         lay.addStretch()
-
-        # 默认选中第 0 个
         self._set_active(0)
 
     def _on_click(self, idx: int):
@@ -110,5 +147,12 @@ class RibbonTabBar(QWidget):
             btn.setStyleSheet(_TAB_ACTIVE if i == idx else _TAB_INACTIVE)
 
     def set_tab(self, idx: int):
-        """从外部切换（不发射信号）。"""
         self._set_active(idx)
+
+    def update_undo_redo(self, can_undo: bool, can_redo: bool,
+                         undo_text: str = "", redo_text: str = ""):
+        """由主窗口在 sig_stack_changed 后调用，刷新按钮状态。"""
+        self.btn_undo.setEnabled(can_undo)
+        self.btn_redo.setEnabled(can_redo)
+        self.btn_undo.setToolTip(f"{undo_text}  (Ctrl+Z)" if undo_text else "撤销  Ctrl+Z")
+        self.btn_redo.setToolTip(f"{redo_text}  (Ctrl+Y)" if redo_text else "重做  Ctrl+Y")
