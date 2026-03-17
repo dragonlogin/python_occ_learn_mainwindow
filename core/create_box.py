@@ -167,6 +167,82 @@ def draw_coordinate_system(display, size):
     display.DisplayMessage(gp_Pnt(0, size * 1.1, 0), "Y", update=False)  # 显示Y轴标签
     display.DisplayMessage(gp_Pnt(0, 0, size * 1.1), "Z", update=False)  # 显示Z轴标签
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 新版矩形面生成逻辑
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _normalize(v):
+    """归一化向量，零向量返回原向量。"""
+    v = np.array(v, dtype=float)
+    mag = np.linalg.norm(v)
+    return v if mag < 1e-12 else v / mag
+
+
+def _normals_parallel(n1, n2, tol: float = 0.01) -> bool:
+    """判断两法向是否平行（允许同向或反向，容差 tol）。"""
+    return abs(float(np.dot(_normalize(n1), _normalize(n2)))) > 1.0 - tol
+
+
+def _build_rect_vertices(line1, line2, face_normal):
+    """
+    用投影法从两条线段构建矩形面的四个顶点。
+
+    算法：
+      1. 取 line1 的方向 u（单位化）作为矩形的一个主轴。
+      2. v = normalize(face_normal × u) 作为另一个主轴（面内垂直于线段）。
+      3. 把四个端点都投影到 u 轴，取 [u_min, u_max] 作为矩形在 u 方向的范围
+         ——这样短的线段会自动延展到对齐长线段的端点。
+      4. line2 在 v 方向的距离 v2 作为矩形在 v 方向的宽度。
+
+    返回 [P0, P1, P2, P3]，顺序保证法向与 face_normal 同向；失败返回 None。
+    """
+    N = _normalize(face_normal)
+
+    d1 = np.array(line1.end, dtype=float) - np.array(line1.start, dtype=float)
+    if np.linalg.norm(d1) < 1e-12:
+        return None
+    u = d1 / np.linalg.norm(d1)
+
+    v = np.cross(N, u)
+    v_len = np.linalg.norm(v)
+    if v_len < 1e-12:          # N 与 u 平行，无法构建面
+        return None
+    v = v / v_len
+
+    O = np.array(line1.start, dtype=float)
+
+    # 四个端点分别在 u、v 轴上的投影，取各自 min/max 确保完整覆盖高度和宽度
+    all_pts = [
+        np.array(line1.start, dtype=float),
+        np.array(line1.end,   dtype=float),
+        np.array(line2.start, dtype=float),
+        np.array(line2.end,   dtype=float),
+    ]
+    pts_u = [float(np.dot(p - O, u)) for p in all_pts]
+    pts_v = [float(np.dot(p - O, v)) for p in all_pts]
+
+    u_min, u_max = min(pts_u), max(pts_u)
+    v_min, v_max = min(pts_v), max(pts_v)
+
+    if abs(u_max - u_min) < 1e-6:
+        return None
+    if abs(v_max - v_min) < 1e-6:   # 两线段共线，无法构建面
+        return None
+
+    # 矩形四个顶点（u、v 双轴均取全范围，确保覆盖最高/最远端点）
+    P0 = O + u_min * u + v_min * v
+    P1 = O + u_max * u + v_min * v
+    P2 = O + u_max * u + v_max * v
+    P3 = O + u_min * u + v_max * v
+
+    # 确保法向与 face_normal 同向
+    computed_n = np.cross(P1 - P0, P3 - P0)
+    if np.dot(computed_n, N) < 0:
+        P0, P1, P2, P3 = P3, P2, P1, P0
+
+    return [P0, P1, P2, P3]
+
+
 def find_common_normal(lines):
     """找到多条线段的公共法向量
     
@@ -253,7 +329,7 @@ def calculate_face_vertices_from_lines(line1, line2, common_normal):
     
     # 过滤掉包含无效顶点的面（比如(0,10,0)这样的点）
     # 检查所有顶点是否都在合理范围内
-    max_coord = 5.0  # 最大坐标值
+    max_coord = 10000.0  # 最大坐标值
     for vertex in face_vertices:
         for coord in vertex:
             if abs(coord) > max_coord * 1.1:  # 允许10%的误差
@@ -289,76 +365,57 @@ def process_three_lines(lines):
     return face1_vertices, face2_vertices, face3_vertices, normal1, normal2, normal3  # 返回三个面的顶点和法向量
 
 def process_multiple_lines(lines):
-    """处理多条线段，计算所有可能的面
-    
-    Args:
-        lines: 线段对象列表
-    
-    Returns:
-        list: 包含面信息的列表，每个面信息包含面对象、顶点、中心点、法向量等
+    """
+    处理多条线段，配对生成矩形面。
+
+    配对规则：两条线段各自有 normal1/normal2，只要其中任意一对法向平行，
+    就说明它们共属同一个面，使用该法向构建矩形。
+
+    矩形构建：投影法，端点自动延展，确保覆盖两条线段各自的全部长度范围。
     """
     if len(lines) < 2:
-        return []  # 如果线段数量少于2，返回空列表
-    
-    # 存储所有面的信息
-    faces = []  # 用于存储所有有效的面
-    
-    # 遍历所有线段对，计算可能的面
+        return []
+
+    faces = []
+
     for i in range(len(lines)):
-        for j in range(i+1, len(lines)):
-            line1 = lines[i]  # 第一条线段
-            line2 = lines[j]  # 第二条线段
-            
-            # 找到公共法向量
-            common_normal = find_common_normal([line1, line2])  # 找到两条线段的公共法向量
-            if common_normal:  # 如果找到公共法向量
-                # 计算面的顶点
-                face_vertices = calculate_face_vertices_from_lines(line1, line2, common_normal)  # 计算面的顶点
-                if face_vertices:  # 如果顶点有效
-                    # 检查是否已经存在相同的面
-                    face_exists = False
-                    for existing_face in faces:
-                        existing_vertices = existing_face['vertices']
-                        # 检查顶点是否相同（顺序可能不同）
-                        if set(tuple(v) for v in face_vertices) == set(tuple(v) for v in existing_vertices):
-                            face_exists = True
-                            break
-                    
-                    if not face_exists:  # 如果面不存在
-                        # 创建面
-                        face = create_face(face_vertices)  # 创建面
-                        if face is not None:  # 如果面创建成功
-                            # 检查面是否为正方形
-                            # 计算所有边的长度
-                            edge_lengths = []
-                            for k in range(4):
-                                v1 = np.array(face_vertices[k])
-                                v2 = np.array(face_vertices[(k+1)%4])
-                                length = np.linalg.norm(v1 - v2)  # 计算边的长度
-                                edge_lengths.append(length)
-                            
-                            # 检查所有边的长度是否相近（正方形）
-                            max_length = max(edge_lengths)
-                            min_length = min(edge_lengths)
-                            if max_length / min_length < 1.1:  # 允许10%的误差
-                                # 计算面中心点
-                                face_center = calculate_face_center(face_vertices)  # 计算面的中心点
-                                # 创建法向量
-                                normal_vector = create_normal_vector(face_center, common_normal)  # 创建法向量
-                                
-                                # 添加到面列表
-                                faces.append({
-                                    'face': face,  # 面对象
-                                    'vertices': face_vertices,  # 面的顶点
-                                    'center': face_center,  # 面的中心点
-                                    'normal': common_normal,  # 面的法向量
-                                    'normal_vector': normal_vector  # 表示法向量的边
-                                })
-                            else:
-                                print(f"Skipping non-square face with edge lengths: {edge_lengths}")  # 跳过非正方形的面
-                        else:
-                            print(f"Skipping invalid face with vertices: {face_vertices}")  # 跳过无效的面
-    
+        for j in range(i + 1, len(lines)):
+            line1, line2 = lines[i], lines[j]
+
+            # 遍历所有法向对，找第一个平行的组合
+            shared_normal = None
+            for n1 in (line1.normal1, line1.normal2):
+                for n2 in (line2.normal1, line2.normal2):
+                    if _normals_parallel(n1, n2):
+                        shared_normal = np.array(n1, dtype=float)
+                        break
+                if shared_normal is not None:
+                    break
+
+            if shared_normal is None:
+                continue
+
+            # 构建矩形顶点（投影法 + 自动延展端点）
+            verts = _build_rect_vertices(line1, line2, shared_normal)
+            if verts is None:
+                continue
+
+            verts_list = [v.tolist() for v in verts]
+            face = create_face(verts_list)
+            if face is None:
+                continue
+
+            center = calculate_face_center(verts_list)
+            normal_vector = create_normal_vector(center, shared_normal)
+
+            faces.append({
+                'face': face,
+                'vertices': verts_list,
+                'center': center,
+                'normal': shared_normal.tolist(),
+                'normal_vector': normal_vector,
+            })
+
     return faces
 
 def main(input_lines=None):
