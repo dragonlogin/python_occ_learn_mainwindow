@@ -8,15 +8,17 @@ panels/line_box_panel.py  ── 线框生成面板
       列表为空时主窗口只做清空，不生成任何几何体。
 """
 
+import re
 from typing import List
 
 import numpy as np
 from PyQt5.QtCore import pyqtSignal, Qt
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
+    QApplication,
     QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QListWidget, QListWidgetItem,
-    QDoubleSpinBox, QLabel, QScrollArea,
+    QCheckBox, QDoubleSpinBox, QLabel, QScrollArea,
 )
 
 from utils.helpers import make_divider, make_section_label
@@ -75,6 +77,8 @@ class LineBoxPanel(QWidget):
     """
 
     sig_lines_changed = pyqtSignal(list)
+    sig_connect_mode_changed = pyqtSignal(bool)
+    sig_label_visible_changed = pyqtSignal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -89,7 +93,24 @@ class LineBoxPanel(QWidget):
         lay.setSpacing(6)
 
         # 输入区
-        lay.addWidget(make_section_label("输入线段"))
+        hdr_row = QHBoxLayout()
+        hdr_row.addWidget(make_section_label("输入线段"))
+        hdr_row.addStretch()
+        btn_paste = QPushButton("📋 粘贴")
+        btn_paste.setToolTip(
+            "从剪贴板粘贴12个数字，格式：\n"
+            "起点X Y Z  法向1 X Y Z  终点X Y Z  法向2 X Y Z\n"
+            "（数字可用空格/逗号/分号分隔）"
+        )
+        btn_paste.setFixedWidth(70)
+        btn_paste.setStyleSheet(
+            "QPushButton{background:#1e2a3a;border:1px solid #304060;"
+            "border-radius:4px;color:#70b8ff;font-size:11px;padding:2px 6px;}"
+            "QPushButton:hover{background:#243244;}"
+        )
+        btn_paste.clicked.connect(self._paste_values)
+        hdr_row.addWidget(btn_paste)
+        lay.addLayout(hdr_row)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -130,6 +151,35 @@ class LineBoxPanel(QWidget):
         add_row.addWidget(btn_add, stretch=2)
         add_row.addWidget(btn_clr, stretch=1)
         lay.addLayout(add_row)
+
+        # 模式选项
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(8)
+        self.chk_connect = QCheckBox("连接面")
+        self.chk_connect.setChecked(True)
+        self.chk_connect.setToolTip("勾选后，当线段 ≥2 条时自动生成面；\n取消勾选则只显示线段和法向")
+        self.chk_connect.setStyleSheet(
+            "QCheckBox{color:#a0b8d0;font-size:11px;}"
+            "QCheckBox::indicator{width:13px;height:13px;border:1px solid #405060;"
+            "border-radius:3px;background:#1a2030;}"
+            "QCheckBox::indicator:checked{background:#3a6090;border-color:#70b8ff;}"
+        )
+        self.chk_connect.toggled.connect(self._on_mode_changed)
+        mode_row.addWidget(self.chk_connect)
+
+        self.chk_labels = QCheckBox("显示标签")
+        self.chk_labels.setChecked(True)
+        self.chk_labels.setToolTip("勾选后在视图中显示线段坐标和法向标签")
+        self.chk_labels.setStyleSheet(
+            "QCheckBox{color:#a0b8d0;font-size:11px;}"
+            "QCheckBox::indicator{width:13px;height:13px;border:1px solid #405060;"
+            "border-radius:3px;background:#1a2030;}"
+            "QCheckBox::indicator:checked{background:#3a6090;border-color:#70b8ff;}"
+        )
+        self.chk_labels.toggled.connect(lambda v: self.sig_label_visible_changed.emit(v))
+        mode_row.addWidget(self.chk_labels)
+        mode_row.addStretch()
+        lay.addLayout(mode_row)
 
         lay.addWidget(make_divider())
 
@@ -179,6 +229,27 @@ class LineBoxPanel(QWidget):
         self._lines.clear()
         self._commit("已清空", color="#ffaa66")
 
+    def _paste_values(self):
+        """从剪贴板解析12个数字填入输入框（起点+法向1+终点+法向2）。"""
+        text = QApplication.clipboard().text()
+        nums = re.findall(r'-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?', text)
+        if len(nums) < 12:
+            self._set_status(f"⚠ 需12个数字，当前仅 {len(nums)} 个", "#ff7766")
+            return
+        try:
+            v = [float(x) for x in nums[:12]]
+        except ValueError:
+            self._set_status("⚠ 数字格式错误", "#ff7766")
+            return
+        self.inp_start.set_value(v[0], v[1], v[2])
+        self.inp_normal1.set_value(v[3], v[4], v[5])
+        self.inp_end.set_value(v[6], v[7], v[8])
+        self.inp_normal2.set_value(v[9], v[10], v[11])
+        self._set_status("✓ 已粘贴", "#88ccaa")
+
+    def _on_mode_changed(self, connect: bool):
+        self.sig_connect_mode_changed.emit(connect)
+
     def _load_preset(self):
         self._lines = [
             LineWithNormals([0,0,0], [0,5,0], [0,0,1], [1,0,0]),
@@ -212,6 +283,14 @@ class LineBoxPanel(QWidget):
             )
             item.setForeground(QColor("#a0c8ff"))
             self.line_list.addItem(item)
+
+    def highlight_line(self, idx: int):
+        """视图 hover 联动：高亮列表中对应行，-1 表示取消高亮。"""
+        if idx < 0:
+            self.line_list.clearSelection()
+            self.line_list.setCurrentRow(-1)
+        elif 0 <= idx < self.line_list.count():
+            self.line_list.setCurrentRow(idx)
 
     def _set_status(self, text: str, color: str = "#88ccaa"):
         self.lbl_status.setText(text)
