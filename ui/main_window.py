@@ -22,7 +22,9 @@ ui/main_window.py  ── 主窗口（含 Undo / Redo）
 import os
 from typing import List
 
-from OCC.Core.AIS        import AIS_Shape
+import numpy as np
+
+from OCC.Core.AIS        import AIS_Shape, AIS_TextLabel
 from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
 from OCC.Core.BRepPrimAPI import (
     BRepPrimAPI_MakeBox, BRepPrimAPI_MakeSphere,
@@ -96,6 +98,8 @@ class MainWindow(QMainWindow):
         self._linebox_extra_ais: list = []
         self._linebox_items: List[ShapeItem] = []
         self._last_linebox_lines: list = []
+        self._connect_faces: bool = True
+        self._show_labels:   bool = True
 
         # 从本地配置读取上次保存的字体大小，默认 12
         self._settings = QSettings("OCCAnalyzer", "Preferences")
@@ -183,6 +187,8 @@ class MainWindow(QMainWindow):
             lambda _: self.viewer.run_analysis()
         )
         self.panel_linebox.sig_lines_changed.connect(self._on_linebox_changed)
+        self.panel_linebox.sig_connect_mode_changed.connect(self._on_connect_mode_changed)
+        self.panel_linebox.sig_label_visible_changed.connect(self._on_label_visible_changed)
         self.panel_settings.sig_font_changed.connect(self._on_font_changed)
 
         return sidebar
@@ -207,6 +213,7 @@ class MainWindow(QMainWindow):
         self.viewer.sig_distance.connect(self._on_distance)
         self.viewer.sig_collision.connect(self._on_collision)
         self.viewer.sig_selected.connect(self._on_viewer_select)
+        self.viewer.sig_linebox_hovered.connect(self.panel_linebox.highlight_line)
         lay.addWidget(self.viewer, stretch=1)
         return right
 
@@ -329,11 +336,20 @@ class MainWindow(QMainWindow):
         self._last_linebox_lines = list(new_lines)
         self.cmd_stack.push(LineboxUpdateCommand(self.ctx, old_lines, new_lines))
 
+    def _on_connect_mode_changed(self, connect: bool):
+        self._connect_faces = connect
+        self._render_linebox(self._last_linebox_lines)
+
+    def _on_label_visible_changed(self, visible: bool):
+        self._show_labels = visible
+        self._render_linebox(self._last_linebox_lines)
+
     def _clear_linebox_render(self):
         ctx = self.viewer._display.Context
         for ais in self._linebox_extra_ais:
             ctx.Remove(ais, False)
         self._linebox_extra_ais.clear()
+        self.viewer.set_linebox_hover_map([])
         for item in self._linebox_items:
             ctx.Remove(item.ais, False)
             if item in self._items:
@@ -343,48 +359,165 @@ class MainWindow(QMainWindow):
 
     def _render_linebox(self, lines: list):
         self._clear_linebox_render()
-        if len(lines) < 2:
-            self._refresh_all()
-            return
-        try:
-            faces = process_multiple_lines(lines)
-        except Exception as e:
-            QMessageBox.critical(self, "生成错误", str(e)); return
-        if not faces:
-            self.panel_linebox._set_status("⚠ 无法生成有效面", "#ff7766")
+        if not lines:
             self._refresh_all()
             return
 
         ctx = self.viewer._display.Context
-        for i, fi in enumerate(faces):
-            r, g, b = _FACE_COLORS[i % len(_FACE_COLORS)]
-            color = Quantity_Color(r, g, b, Quantity_TOC_RGB)
-            name  = f"Face_{len(self._items) + 1}"
-            item  = self._make_item(fi['face'], name)
-            item.color = (r, g, b); item.ais.SetColor(color)
-            self._items.append(item)
-            self._display_item(item)
-            self._linebox_items.append(item)
-            nv = AIS_Shape(fi['normal_vector']); nv.SetColor(color)
-            ctx.Display(nv, False)
-            self._linebox_extra_ais.append(nv)
 
-        white = Quantity_Color(1, 1, 1, Quantity_TOC_RGB)
-        for line in lines:
-            edge = BRepBuilderAPI_MakeEdge(
-                gp_Pnt(float(line.start[0]),float(line.start[1]),float(line.start[2])),
-                gp_Pnt(float(line.end[0]),  float(line.end[1]),  float(line.end[2])),
-            ).Edge()
-            ea = AIS_Shape(edge); ea.SetColor(white)
+        col_line = qty_color(1.0, 1.0, 1.0)          # 线段：白
+        col_n1   = qty_color(0.25, 0.90, 0.45)        # 法向1：绿
+        col_n2   = qty_color(1.00, 0.60, 0.20)        # 法向2：橙
+        col_lbl_seg = qty_color(1.0, 1.0, 0.25)       # 标签：亮黄（线段）
+        col_lbl_n1  = qty_color(0.40, 1.0, 0.40)      # 标签：亮绿（法向1）
+        col_lbl_n2  = qty_color(1.0, 0.80, 0.20)      # 标签：亮橙（法向2）
+
+        def _normal_len(line) -> float:
+            seg_len = float(np.linalg.norm(line.end - line.start))
+            return max(1.0, min(5.0, seg_len * 0.3))
+
+        def _make_label(pos: gp_Pnt, text: str, color, height: float = 12.0) -> AIS_TextLabel:
+            lbl = AIS_TextLabel()
+            lbl.SetText(text)
+            lbl.SetPosition(pos)
+            lbl.SetColor(color)
+            lbl.SetHeight(height)
+            return lbl
+
+        # hover 映射：(AIS_Shape边, 线段索引)
+        hover_map = []
+
+        for i, line in enumerate(lines):
+            # ── 线段本体（保持激活以支持 hover 检测）──
+            ea = AIS_Shape(BRepBuilderAPI_MakeEdge(
+                gp_Pnt(float(line.start[0]), float(line.start[1]), float(line.start[2])),
+                gp_Pnt(float(line.end[0]),   float(line.end[1]),   float(line.end[2])),
+            ).Edge())
+            ea.SetColor(col_line)
+            ea.SetWidth(2.5)
             ctx.Display(ea, False)
+            # 不调用 Deactivate —— 保留 hover 探测
             self._linebox_extra_ais.append(ea)
+            hover_map.append((ea, i))
+
+            # ── 法向箭头（deactivate，减少拾取噪声）──
+            mid  = (line.start + line.end) / 2.0
+            nlen = _normal_len(line)
+            for normal_arr, col in (
+                (np.array(line.normal1, dtype=float), col_n1),
+                (np.array(line.normal2, dtype=float), col_n2),
+            ):
+                mag = np.linalg.norm(normal_arr)
+                if mag < 1e-9:
+                    continue
+                tip = mid + normal_arr / mag * nlen
+                na = AIS_Shape(BRepBuilderAPI_MakeEdge(
+                    gp_Pnt(float(mid[0]), float(mid[1]), float(mid[2])),
+                    gp_Pnt(float(tip[0]), float(tip[1]), float(tip[2])),
+                ).Edge())
+                na.SetColor(col)
+                na.SetWidth(1.5)
+                ctx.Display(na, False)
+                ctx.Deactivate(na)
+                self._linebox_extra_ais.append(na)
+
+            # ── 标签（可通过 checkbox 控制，用 AIS_TextLabel 管理）──
+            if self._show_labels:
+                seg_len = float(np.linalg.norm(line.end - line.start))
+
+                # 线段起点、终点、长度
+                for pos, text in (
+                    (gp_Pnt(float(line.start[0]), float(line.start[1]), float(line.start[2])),
+                     f"S{i+1}({line.start[0]:.1f},{line.start[1]:.1f},{line.start[2]:.1f})"),
+                    (gp_Pnt(float(line.end[0]), float(line.end[1]), float(line.end[2])),
+                     f"E{i+1}({line.end[0]:.1f},{line.end[1]:.1f},{line.end[2]:.1f})"),
+                    (gp_Pnt(float(mid[0] + 0.15), float(mid[1] + 0.15), float(mid[2])),
+                     f"Len:{seg_len:.2f}"),
+                ):
+                    lbl = _make_label(pos, text, col_lbl_seg)
+                    ctx.Display(lbl, False)
+                    ctx.Deactivate(lbl)
+                    self._linebox_extra_ais.append(lbl)
+
+                # 法向1 标签
+                n1_arr = np.array(line.normal1, dtype=float)
+                mag1 = np.linalg.norm(n1_arr)
+                if mag1 > 1e-9:
+                    n1_tip = mid + n1_arr / mag1 * nlen
+                    for pos, text in (
+                        (gp_Pnt(float(mid[0] - 0.15), float(mid[1]), float(mid[2] + 0.15)),
+                         f"N1({line.normal1[0]:.2f},{line.normal1[1]:.2f},{line.normal1[2]:.2f})"),
+                        (gp_Pnt(float(n1_tip[0]), float(n1_tip[1]), float(n1_tip[2])),
+                         "N1"),
+                    ):
+                        lbl = _make_label(pos, text, col_lbl_n1)
+                        ctx.Display(lbl, False)
+                        ctx.Deactivate(lbl)
+                        self._linebox_extra_ais.append(lbl)
+
+                # 法向2 标签
+                n2_arr = np.array(line.normal2, dtype=float)
+                mag2 = np.linalg.norm(n2_arr)
+                if mag2 > 1e-9:
+                    n2_tip = mid + n2_arr / mag2 * nlen
+                    for pos, text in (
+                        (gp_Pnt(float(mid[0] + 0.15), float(mid[1] - 0.15), float(mid[2] + 0.15)),
+                         f"N2({line.normal2[0]:.2f},{line.normal2[1]:.2f},{line.normal2[2]:.2f})"),
+                        (gp_Pnt(float(n2_tip[0]), float(n2_tip[1]), float(n2_tip[2])),
+                         "N2"),
+                    ):
+                        lbl = _make_label(pos, text, col_lbl_n2)
+                        ctx.Display(lbl, False)
+                        ctx.Deactivate(lbl)
+                        self._linebox_extra_ais.append(lbl)
+
+        # 传递 hover 映射给 viewer
+        self.viewer.set_linebox_hover_map(hover_map)
+
+        # 连接面模式：有 ≥2 条线时生成面
+        if self._connect_faces and len(lines) >= 2:
+            try:
+                faces = process_multiple_lines(lines)
+            except Exception as e:
+                QMessageBox.critical(self, "生成错误", str(e))
+                ctx.UpdateCurrentViewer()
+                self._refresh_all()
+                return
+
+            if not faces:
+                self.panel_linebox._set_status("⚠ 无法生成有效面", "#ff7766")
+            else:
+                for i, fi in enumerate(faces):
+                    r, g, b = _FACE_COLORS[i % len(_FACE_COLORS)]
+                    color = Quantity_Color(r, g, b, Quantity_TOC_RGB)
+                    name  = f"Face_{len(self._items) + 1}"
+                    item  = self._make_item(fi['face'], name)
+                    item.color = (r, g, b); item.ais.SetColor(color)
+                    self._items.append(item)
+                    self._display_item(item)
+                    self._linebox_items.append(item)
+                    nv = AIS_Shape(fi['normal_vector'])
+                    nv.SetColor(color)
+                    nv.SetWidth(1.5)
+                    ctx.Display(nv, False)
+                    ctx.Deactivate(nv)
+                    self._linebox_extra_ais.append(nv)
+
+                n = len(faces)
+                self.panel_linebox._set_status(f"✓ 已生成 {n} 个面", "#88ffcc")
+                self._set_status(
+                    f"✓ 线框：{len(lines)} 条 → {n} 个面", "#44ddcc")
+        else:
+            if not self._connect_faces:
+                self.panel_linebox._set_status(
+                    f"预览模式：{len(lines)} 条线段（未连面）", "#a0c8ff")
+            else:
+                self.panel_linebox._set_status(
+                    f"已添加 {len(lines)} 条（需 ≥2 条才连面）", "#a0c8ff")
 
         ctx.UpdateCurrentViewer()
         self.viewer._display.FitAll()
         self._refresh_all()
-        n = len(faces)
-        self.panel_linebox._set_status(f"✓ 已生成 {n} 个面", "#88ffcc")
-        self._set_status(f"✓ 线框：{len(lines)} 条 → {n} 个面", "#44ddcc")
 
     # ── 字体 ─────────────────────────────────────────────────────────────────
 

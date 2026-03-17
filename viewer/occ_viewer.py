@@ -54,6 +54,7 @@ class OCCViewer(qtViewer3d):
     sig_distance  = pyqtSignal(object)   # DistanceResult
     sig_collision = pyqtSignal(list)     # List[CollisionEntry]
     sig_selected  = pyqtSignal(int)      # shape index
+    sig_linebox_hovered = pyqtSignal(int)  # line index (-1 = none)
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -70,12 +71,21 @@ class OCCViewer(qtViewer3d):
 
         # 距离连线 AIS（每帧重建）
         self._dist_line_ais: Optional[AIS_Shape] = None
+
+        # linebox hover 映射：List[(AIS_Shape, line_index)]
+        self._linebox_hover_list: list = []
+        self._last_hovered_line_idx: int = -1
         
 
     # ── 外部接口 ──────────────────────────────────────────────────────────────
 
     def set_items(self, items: List[ShapeItem]) -> None:
         self._items = items
+
+    def set_linebox_hover_map(self, hover_list: list) -> None:
+        """设置 linebox hover 映射：List[(AIS_Shape, line_index)]"""
+        self._linebox_hover_list = hover_list
+        self._last_hovered_line_idx = -1
 
     def run_analysis(self) -> None:
         """外部调用：立即执行一次分析并发射信号。"""
@@ -169,9 +179,23 @@ class OCCViewer(qtViewer3d):
             return
 
         # 非拖拽：高亮探测
-        self._display.Context.MoveTo(
-            event.x(), event.y(), self._display.GetView(), True
-        )
+        ctx = self._display.Context
+        ctx.MoveTo(event.x(), event.y(), self._display.GetView(), True)
+
+        # linebox hover 联动
+        if self._linebox_hover_list:
+            hovered_idx = -1
+            if ctx.HasDetected():
+                detected = ctx.DetectedInteractive()
+                det_ptr = detected.this
+                for ais_obj, line_idx in self._linebox_hover_list:
+                    if det_ptr == ais_obj.this:
+                        hovered_idx = line_idx
+                        break
+            if hovered_idx != self._last_hovered_line_idx:
+                self._last_hovered_line_idx = hovered_idx
+                self.sig_linebox_hovered.emit(hovered_idx)
+
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
