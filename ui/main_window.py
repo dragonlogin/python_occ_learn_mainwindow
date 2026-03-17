@@ -74,12 +74,17 @@ _COLORS = [
     (0.20, 0.80, 0.90), (0.90, 0.50, 0.10),
 ]
 
-_PRIMITIVES_FACTORIES = {
-    "Box":      lambda: BRepPrimAPI_MakeBox(40, 30, 20).Shape(),
-    "Sphere":   lambda: BRepPrimAPI_MakeSphere(20).Shape(),
-    "Cylinder": lambda: BRepPrimAPI_MakeCylinder(15, 40).Shape(),
-    "Cone":     lambda: BRepPrimAPI_MakeCone(15, 5, 40).Shape(),
-}
+def _build_primitive_shape(name: str, params: dict):
+    """根据体素名称和参数字典创建 TopoDS_Shape。"""
+    if name == "Box":
+        return BRepPrimAPI_MakeBox(params["dx"], params["dy"], params["dz"]).Shape()
+    if name == "Sphere":
+        return BRepPrimAPI_MakeSphere(params["r"]).Shape()
+    if name == "Cylinder":
+        return BRepPrimAPI_MakeCylinder(params["r"], params["h"]).Shape()
+    if name == "Cone":
+        return BRepPrimAPI_MakeCone(params["r1"], params["r2"], params["h"]).Shape()
+    raise ValueError(f"未知体素类型: {name}")
 
 _FACE_COLORS = [
     (1.0,0.3,0.3),(0.3,1.0,0.4),(0.3,0.5,1.0),
@@ -176,7 +181,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.stack)
 
         # ── 信号连接 ──────────────────────────────────────────────────────
-        self.panel_shapes.sig_add_primitive.connect(self._add_primitive)
+        self.panel_shapes.sig_add_primitive.connect(self._add_primitive)  # (str, dict)
         self.panel_shapes.sig_import_file.connect(self._import_file)
         self.panel_shapes.sig_delete.connect(self._delete_shape)
         self.panel_shapes.sig_toggle.connect(self._toggle_shape)
@@ -247,6 +252,8 @@ class MainWindow(QMainWindow):
     def _init_scene(self):
         self.viewer.InitDriver()
         self.viewer._display.set_bg_gradient_color([10, 10, 20], [22, 22, 45])
+        self.viewer.add_trihedron()
+        self.viewer.add_view_cube()
         self._refresh_all()
 
     # ── 低级渲染原语 ──────────────────────────────────────────────────────────
@@ -288,18 +295,24 @@ class MainWindow(QMainWindow):
 
     # ── 操作 → 命令 ───────────────────────────────────────────────────────────
 
-    def _add_primitive(self, prim: str):
-        factory = _PRIMITIVES_FACTORIES.get(prim)
-        if not factory:
-            return
+    def _add_primitive(self, prim: str, params: dict):
         try:
-            topo = factory()
+            topo = _build_primitive_shape(prim, params)
         except Exception as e:
             QMessageBox.warning(self, "错误", f"创建形体失败:\n{e}")
             return
         name = f"{prim}_{len(self._items) + 1}"
         item = self._make_item(topo, name)
-        item.offset = gp_Vec(len(self._items) * 70, 0, 0)
+        item.offset = gp_Vec(
+            params.get("x", 0.0),
+            params.get("y", 0.0),
+            params.get("z", 0.0),
+        )
+        item.rpy = (
+            params.get("roll",  0.0),
+            params.get("pitch", 0.0),
+            params.get("yaw",   0.0),
+        )
         self.cmd_stack.push(AddShapeCommand(self.ctx, item))
 
     def _import_file(self, path: str):

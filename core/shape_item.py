@@ -18,7 +18,7 @@ from OCC.Core.Bnd import Bnd_Box
 from OCC.Core.GProp import GProp_GProps
 from OCC.Core.TopLoc import TopLoc_Location
 from OCC.Core.TopoDS import TopoDS_Shape
-from OCC.Core.gp import gp_Trsf, gp_Vec, gp_Pnt
+from OCC.Core.gp import gp_Trsf, gp_Vec, gp_Pnt, gp_Ax1, gp_Dir
 
 
 @dataclass
@@ -30,7 +30,8 @@ class ShapeItem:
         name    : 显示名称
         ais     : AIS_Shape，用于 OCC 渲染上下文
         topo    : 原始 TopoDS_Shape（未移动）
-        offset  : 当前累计平移向量
+        offset  : 当前累计平移向量 (x, y, z)
+        rpy     : 旋转角 (roll, pitch, yaw)，单位度，ZYX 外旋顺序
         color   : RGB 颜色元组，0‥1
         visible : 是否可见
     """
@@ -38,24 +39,38 @@ class ShapeItem:
     ais:     AIS_Shape
     topo:    TopoDS_Shape
     offset:  gp_Vec                      = field(default_factory=lambda: gp_Vec(0, 0, 0))
+    rpy:     Tuple[float, float, float]  = (0.0, 0.0, 0.0)
     color:   Tuple[float, float, float]  = (0.3, 0.6, 1.0)
     visible: bool                        = True
 
     # ── 变换 ────────────────────────────────────────────────────────────────
 
+    def _make_transform(self) -> gp_Trsf:
+        """组合 RPY 旋转（ZYX 外旋）+ 平移，返回 gp_Trsf。"""
+        roll_r  = math.radians(self.rpy[0])
+        pitch_r = math.radians(self.rpy[1])
+        yaw_r   = math.radians(self.rpy[2])
+
+        o = gp_Pnt(0, 0, 0)
+        tr = gp_Trsf(); tr.SetRotation(gp_Ax1(o, gp_Dir(1, 0, 0)), roll_r)
+        tp = gp_Trsf(); tp.SetRotation(gp_Ax1(o, gp_Dir(0, 1, 0)), pitch_r)
+        ty = gp_Trsf(); ty.SetRotation(gp_Ax1(o, gp_Dir(0, 0, 1)), yaw_r)
+        # ZYX 外旋：先 yaw，再 pitch，再 roll
+        rot = tr.Multiplied(tp).Multiplied(ty)
+
+        tt = gp_Trsf()
+        tt.SetTranslation(self.offset)
+        return tt.Multiplied(rot)   # 先旋转再平移
+
     def apply_offset(self, ctx) -> None:
-        """将当前 offset 作为平移变换应用到 AIS 对象。"""
-        trsf = gp_Trsf()
-        trsf.SetTranslation(self.offset)
-        ctx.SetLocation(self.ais, TopLoc_Location(trsf))
+        """将当前变换（旋转 + 平移）应用到 AIS 对象。"""
+        ctx.SetLocation(self.ais, TopLoc_Location(self._make_transform()))
 
     # ── 几何查询（均作用于 Located Shape）──────────────────────────────────
 
     def located_shape(self) -> TopoDS_Shape:
         """返回已附加 Location 的 TopoDS_Shape，供 BRepExtrema 等使用。"""
-        trsf = gp_Trsf()
-        trsf.SetTranslation(self.offset)
-        return self.topo.Located(TopLoc_Location(trsf))
+        return self.topo.Located(TopLoc_Location(self._make_transform()))
 
     def center(self) -> gp_Pnt:
         """返回包围盒中心（世界坐标）。"""
